@@ -2,7 +2,7 @@
 Dashboard de suivi des chaînes de valeur agro-industrielles
 --------------------------------------------------------------
 Source de données : API ouverte de la Banque mondiale (World Bank Open Data)
-Technologies : Python, Streamlit, Plotly, Requests, Pandas
+Technologies : Python, Streamlit, Plotly, Requests, Pandas, Statsmodels
 
 Contexte : suit les indicateurs clés des filières agro-industrielles
 (céréales, élevage, production alimentaire, terres agricoles...) pour
@@ -14,10 +14,12 @@ Auteur : Cheikh SOW
 import streamlit as st
 import requests
 import pandas as pd
+import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
+from statsmodels.tsa.holtwinters import Holt
 
 # ---------------------------------------------------------------------------
 # Configuration de la page
@@ -33,18 +35,13 @@ st.set_page_config(
 # ---------------------------------------------------------------------------
 st.markdown("""
 <style>
-    /* Fond principal léger et épuré */
     .main {
         background-color: #F8F9FA;
     }
-    
-    /* Titres vert forêt */
     h1, h2, h3 {
         color: #1E5631 !important;
         font-family: 'Segoe UI', Roboto, sans-serif;
     }
-    
-    /* Cartes KPI (Métriques) */
     div[data-testid="stMetric"] {
         background-color: #FFFFFF;
         border: 1px solid #E2E8F0;
@@ -52,21 +49,15 @@ st.markdown("""
         padding: 16px;
         box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
     }
-    
-    /* Intitulés des métriques */
     div[data-testid="stMetricLabel"] {
         color: #4A5568;
         font-weight: 600;
         font-size: 0.9rem;
     }
-    
-    /* Valeurs des métriques */
     div[data-testid="stMetricValue"] {
         color: #1E5631;
         font-weight: 700;
     }
-
-    /* Barre latérale personnalisée */
     section[data-testid="stSidebar"] {
         background-color: #1E2923;
     }
@@ -82,18 +73,17 @@ st.markdown("""
 
 # Palette de couleurs dédiée pour la comparaison des pays
 COLOR_DISCRETE_MAP = {
-    "Sénégal": "#008751",        # Vert fort (Sénégal)
-    "Mali": "#E2A03F",           # Or / Ocre
-    "Côte d'Ivoire": "#E67E22",  # Orange terre cuite
-    "Ghana": "#27AE60",          # Vert herbe
-    "Burkina Faso": "#8E44AD",   # Violet sobre
-    "Nigeria": "#2C3E50",        # Bleu nuit
-    "Mauritanie": "#D35400"      # Ocre rouille
+    "Sénégal": "#008751",
+    "Mali": "#E2A03F",
+    "Côte d'Ivoire": "#E67E22",
+    "Ghana": "#27AE60",
+    "Burkina Faso": "#8E44AD",
+    "Nigeria": "#2C3E50",
+    "Mauritanie": "#D35400"
 }
 
 WB_API_URL = "https://api.worldbank.org/v2/country/{countries}/indicator/{indicator}"
 
-# Indicateurs représentatifs des filières agro-industrielles (type Agropoles)
 INDICATORS = {
     "Valeur ajoutée agriculture (% du PIB)": "NV.AGR.TOTL.ZS",
     "Croissance valeur ajoutée agricole (% annuel)": "NV.AGR.TOTL.KD.ZG",
@@ -105,7 +95,6 @@ INDICATORS = {
     "Exportations agricoles (% exportations totales)": "TX.VAL.AGRI.ZS.UN",
 }
 
-# Pays par défaut : Sénégal + voisins régionaux pertinents pour la comparaison
 COUNTRIES = {
     "Sénégal": "SEN",
     "Mali": "MLI",
@@ -149,7 +138,6 @@ def fetch_indicator(indicator_code: str, country_codes: list[str], year_start: i
         resp.raise_for_status()
         payload = resp.json()
     except requests.RequestException:
-        # Message discret géré dans l'interface principal
         return pd.DataFrame()
 
     if not isinstance(payload, list) or len(payload) < 2 or payload[1] is None:
@@ -178,9 +166,46 @@ def fetch_all_indicators(country_codes: list[str], year_start: int, year_end: in
 
 
 # ---------------------------------------------------------------------------
+# 🔮 Prévision (Holt - lissage exponentiel avec tendance)
+# ---------------------------------------------------------------------------
+@st.cache_data(ttl=3600, show_spinner=False)
+def forecast_series(years: list[int], values: list[float], horizon: int) -> pd.DataFrame:
+    """
+    Prévoit les `horizon` prochaines années à partir d'une série annuelle,
+    avec la méthode de Holt (lissage exponentiel double, tendance additive).
+    Retourne un DataFrame avec les bornes d'un intervalle de confiance approximatif (~80%).
+    """
+    series = pd.Series(values, index=years).sort_index()
+
+    if len(series) < 4:
+        return pd.DataFrame()
+
+    model = Holt(series.values, initialization_method="estimated")
+    fit = model.fit(optimized=True)
+
+    forecast_values = fit.forecast(horizon)
+
+    residuals = series.values - fit.fittedvalues
+    resid_std = np.std(residuals) if len(residuals) > 1 else 0.0
+    z_80 = 1.28  # ~80% d'intervalle de confiance
+
+    future_years = list(range(series.index[-1] + 1, series.index[-1] + 1 + horizon))
+    steps = np.arange(1, horizon + 1)
+    margin = z_80 * resid_std * np.sqrt(steps)
+
+    forecast_df = pd.DataFrame({
+        "year": future_years,
+        "value": forecast_values,
+        "lower": forecast_values - margin,
+        "upper": forecast_values + margin,
+    })
+    return forecast_df
+
+
+# ---------------------------------------------------------------------------
 # Sidebar - Filtres
 # ---------------------------------------------------------------------------
-st.sidebar.title("🌾 Filtres")
+st.sidebar.title("Filtres")
 
 selected_indicator_label = st.sidebar.selectbox("Indicateur principal", list(INDICATORS.keys()))
 selected_countries = st.sidebar.multiselect(
@@ -243,15 +268,15 @@ col_ts, col_rank = st.columns([1.3, 1])
 with col_ts:
     st.subheader(f"Évolution — {selected_indicator_label}")
     fig_ts = px.line(
-        df.sort_values("year"), 
-        x="year", 
-        y="value", 
-        color="country", 
+        df.sort_values("year"),
+        x="year",
+        y="value",
+        color="country",
         markers=True,
         color_discrete_map=COLOR_DISCRETE_MAP
     )
     fig_ts.update_layout(
-        margin=dict(l=10, r=10, t=20, b=10), 
+        margin=dict(l=10, r=10, t=20, b=10),
         legend_title="Pays",
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
@@ -263,22 +288,21 @@ with col_ts:
 
 with col_rank:
     st.subheader(f"Classement {latest_year}")
-    
-    # Met en évidence le Sénégal en vert et les autres en gris
+
     latest_df["bar_color"] = latest_df["country"].apply(
         lambda x: "#008751" if x == FOCUS_COUNTRY else "#CBD5E0"
     )
 
     fig_rank = px.bar(
-        latest_df, 
-        x="value", 
-        y="country", 
+        latest_df,
+        x="value",
+        y="country",
         orientation="h",
         color="bar_color",
         color_discrete_map="identity"
     )
     fig_rank.update_layout(
-        showlegend=False, 
+        showlegend=False,
         margin=dict(l=10, r=10, t=20, b=10),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
@@ -286,6 +310,80 @@ with col_rank:
     )
     fig_rank.update_xaxes(showgrid=True, gridcolor="#E2E8F0")
     st.plotly_chart(fig_rank, use_container_width=True)
+
+st.markdown("---")
+
+# ---------------------------------------------------------------------------
+# 🔮 Module de prévision (ML)
+# ---------------------------------------------------------------------------
+st.subheader(" Prévision — projection à moyen terme")
+st.caption(
+    "Projection basée sur la méthode de Holt (lissage exponentiel avec tendance), "
+    "adaptée aux séries annuelles courtes. Zone ombrée = intervalle de confiance ~80%."
+)
+
+col_fc1, col_fc2 = st.columns([1, 3])
+with col_fc1:
+    forecast_country = st.selectbox(
+        "Pays à projeter", selected_countries,
+        index=selected_countries.index(FOCUS_COUNTRY) if FOCUS_COUNTRY in selected_countries else 0,
+    )
+    forecast_horizon = st.slider("Horizon (années)", 1, 10, 5)
+
+country_series = df[df["country"] == forecast_country].sort_values("year")
+
+if len(country_series) < 4:
+    st.info(f"Pas assez de points de données pour {forecast_country} sur cette période afin de générer une prévision fiable (minimum 4 années).")
+else:
+    forecast_df = forecast_series(
+        country_series["year"].tolist(),
+        country_series["value"].tolist(),
+        forecast_horizon,
+    )
+
+    if forecast_df.empty:
+        st.info("Données insuffisantes pour générer une prévision.")
+    else:
+        fig_forecast = go.Figure()
+
+        fig_forecast.add_trace(go.Scatter(
+            x=country_series["year"], y=country_series["value"],
+            mode="lines+markers", name="Historique",
+            line=dict(color="#008751", width=2),
+        ))
+
+        fig_forecast.add_trace(go.Scatter(
+            x=pd.concat([forecast_df["year"], forecast_df["year"][::-1]]),
+            y=pd.concat([forecast_df["upper"], forecast_df["lower"][::-1]]),
+            fill="toself", fillcolor="rgba(0, 135, 81, 0.15)",
+            line=dict(color="rgba(255,255,255,0)"),
+            name="Intervalle ~80%", showlegend=True,
+        ))
+
+        fig_forecast.add_trace(go.Scatter(
+            x=forecast_df["year"], y=forecast_df["value"],
+            mode="lines+markers", name="Prévision",
+            line=dict(color="#E67E22", width=2, dash="dash"),
+        ))
+
+        fig_forecast.update_layout(
+            margin=dict(l=10, r=10, t=20, b=10),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            hovermode="x unified",
+            legend_title="",
+        )
+        fig_forecast.update_yaxes(showgrid=True, gridcolor="#E2E8F0", title=selected_indicator_label)
+        fig_forecast.update_xaxes(showgrid=False, title="Année")
+        st.plotly_chart(fig_forecast, use_container_width=True)
+
+        last_actual = country_series["value"].iloc[-1]
+        last_forecast = forecast_df["value"].iloc[-1]
+        trend = "en hausse 📈" if last_forecast > last_actual else "en baisse 📉" if last_forecast < last_actual else "stable ➖"
+        st.caption(
+            f"Projection {forecast_country} en {int(forecast_df['year'].iloc[-1])} : "
+            f"**{last_forecast:,.1f}** (tendance {trend} par rapport à {int(country_series['year'].iloc[-1])} : {last_actual:,.1f})"
+        )
 
 st.markdown("---")
 
@@ -326,27 +424,25 @@ if show_radar:
 
     if radar_labels:
         fig_radar = go.Figure()
-        
-        # Traitement Sénégal (Vert fort)
+
         fig_radar.add_trace(go.Scatterpolar(
-            r=senegal_scores, 
-            theta=radar_labels, 
-            fill="toself", 
+            r=senegal_scores,
+            theta=radar_labels,
+            fill="toself",
             name="Sénégal",
             fillcolor="rgba(0, 135, 81, 0.35)",
             line=dict(color="#008751", width=2)
         ))
-        
-        # Traitement Moyenne Régionale (Gris discret)
+
         fig_radar.add_trace(go.Scatterpolar(
-            r=regional_scores, 
-            theta=radar_labels, 
-            fill="toself", 
+            r=regional_scores,
+            theta=radar_labels,
+            fill="toself",
             name="Moyenne régionale",
             fillcolor="rgba(160, 174, 192, 0.25)",
             line=dict(color="#718096", width=2, dash="dash")
         ))
-        
+
         fig_radar.update_layout(
             polar=dict(
                 radialaxis=dict(visible=True, range=[0, 1], gridcolor="#E2E8F0"),
